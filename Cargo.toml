@@ -1,6 +1,6 @@
 [package]
 name = "sip-honeypot"
-version = "0.1.0"
+version = "0.1.1"
 authors = ["2026, Philippe TEMESI"]
 description = "A SIP honeypot for detecting and analyzing SIP attacks"
 repository = "https://www.tems.be"

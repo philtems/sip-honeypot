@@ -13,6 +13,56 @@ use tokio::net::UdpSocket;
 use tokio::sync::Mutex;
 use tokio::time;
 
+// ==================== FONCTIONS DE FILTRAGE ====================
+
+/// Filtre pour ne garder que les caractères ASCII imprimables et les espaces blancs
+fn filter_printable_chars(input: &str) -> String {
+    input.chars()
+        .filter(|c| {
+            c.is_ascii_graphic() || 
+            c.is_ascii_whitespace() || 
+            *c == '\n' || 
+            *c == '\r' || 
+            *c == '\t'
+        })
+        .collect()
+}
+
+/// Remplace les caractères non imprimables par �
+fn filter_safe_display(input: &str) -> String {
+    input.chars()
+        .map(|c| {
+            if c.is_ascii_graphic() || c.is_ascii_whitespace() || c == '\n' || c == '\r' {
+                c
+            } else {
+                '�'
+            }
+        })
+        .collect()
+}
+
+/// Convertit les caractères non imprimables en séquences d'échappement
+fn safe_log_string(input: &str) -> String {
+    let mut result = String::with_capacity(input.len());
+    for c in input.chars() {
+        match c {
+            '\0' => result.push_str("\\0"),
+            '\x01'..='\x08' | '\x0b' | '\x0c' | '\x0e'..='\x1f' | '\x7f' => {
+                result.push_str(&format!("\\x{:02x}", c as u32));
+            }
+            _ if c.is_ascii_graphic() || c.is_ascii_whitespace() || c == '\n' || c == '\r' => {
+                result.push(c);
+            }
+            _ => {
+                result.push_str(&format!("\\u{{{:x}}}", c as u32));
+            }
+        }
+    }
+    result
+}
+
+// ==================== STRUCTURES PRINCIPALES ====================
+
 #[derive(Debug, StructOpt, Clone)]
 #[structopt(
     name = "sip-honeypot",
@@ -41,6 +91,10 @@ struct Opt {
     #[structopt(short = "v", long = "verbose")]
     verbose: bool,
     
+    /// Enable raw display (not filtered) - DANGEROUS: can break terminal with control chars
+    #[structopt(short = "r", long = "raw")]
+    raw_display: bool,
+    
     /// Show help
     #[structopt(short = "h", long = "help")]
     help: bool,
@@ -55,10 +109,11 @@ struct SipHoneypot {
     socket: Arc<UdpSocket>,
     log_writer: Option<Arc<Mutex<BufWriter<File>>>>,
     verbose: bool,
+    raw_display: bool,
 }
 
 impl SipHoneypot {
-    async fn new(addr: &str, port: u16, log_file: Option<PathBuf>, verbose: bool) -> Result<Self> {
+    async fn new(addr: &str, port: u16, log_file: Option<PathBuf>, verbose: bool, raw_display: bool) -> Result<Self> {
         let bind_addr = format!("{}:{}", addr, port);
         let socket = UdpSocket::bind(&bind_addr).await
             .with_context(|| format!("Failed to bind to {}", bind_addr))?;
@@ -66,6 +121,11 @@ impl SipHoneypot {
         println!("[INFO] SIP honeypot server started on {}", bind_addr);
         if verbose {
             println!("[INFO] Verbose mode enabled - SIP details will be logged");
+        }
+        if raw_display {
+            println!("[WARNING] Raw display enabled - Terminal may be affected by control characters");
+        } else {
+            println!("[INFO] Display filtering enabled - Control characters are sanitized");
         }
         
         let log_writer = if let Some(path) = &log_file {
@@ -85,20 +145,34 @@ impl SipHoneypot {
             socket: Arc::new(socket),
             log_writer,
             verbose,
+            raw_display,
         })
     }
     
     async fn log(&self, client_addr: &SocketAddr, message: &str) {
         let timestamp = Local::now().format("%Y-%m-%d %H:%M:%S%.3f");
-        let log_line = format!("{} {} {}\n", timestamp, client_addr, message);
         
-        // Always display to stdout
-        print!("{}", log_line);
+        // Filtrer le message pour l'affichage
+        let display_message = if self.raw_display {
+            message.to_string()
+        } else {
+            filter_printable_chars(message)
+        };
         
-        // Write to file if specified
+        let log_line = format!("{} {} {}\n", timestamp, client_addr, display_message);
+        
+        // Affichage console (filtré ou raw selon option)
+        if self.raw_display {
+            print!("{}", log_line);
+        } else {
+            print!("{}", filter_printable_chars(&log_line));
+        }
+        
+        // Écriture fichier (toujours en version originale pour conserver les données)
         if let Some(writer) = &self.log_writer {
             let mut writer = writer.lock().await;
-            if let Err(e) = writer.write_all(log_line.as_bytes()) {
+            let file_line = format!("{} {} {}\n", timestamp, client_addr, message);
+            if let Err(e) = writer.write_all(file_line.as_bytes()) {
                 eprintln!("[ERROR] Log write: {}", e);
             }
             if let Err(e) = writer.flush() {
@@ -112,6 +186,13 @@ impl SipHoneypot {
             let timestamp = Local::now().format("%Y-%m-%d %H:%M:%S%.3f");
             let separator = "─".repeat(60);
             
+            // Version filtrée pour l'affichage console
+            let display_details = if self.raw_display {
+                details.to_string()
+            } else {
+                safe_log_string(details)
+            };
+            
             let verbose_log = format!(
                 "{}\n{} VERBOSE: {} {}\n{}\n{}\n{}\n\n",
                 separator,
@@ -119,17 +200,31 @@ impl SipHoneypot {
                 client_addr,
                 title,
                 separator,
-                details,
+                display_details,
                 separator
             );
             
-            // Display to stdout
-            print!("{}", verbose_log);
+            // Affichage console
+            if self.raw_display {
+                print!("{}", verbose_log);
+            } else {
+                print!("{}", filter_printable_chars(&verbose_log));
+            }
             
-            // Write to file if specified
+            // Écriture fichier (version safe)
             if let Some(writer) = &self.log_writer {
                 let mut writer = writer.lock().await;
-                if let Err(e) = writer.write_all(verbose_log.as_bytes()) {
+                let file_log = format!(
+                    "{}\n{} VERBOSE: {} {}\n{}\n{}\n{}\n\n",
+                    separator,
+                    timestamp,
+                    client_addr,
+                    title,
+                    separator,
+                    safe_log_string(details),
+                    separator
+                );
+                if let Err(e) = writer.write_all(file_log.as_bytes()) {
                     eprintln!("[ERROR] Log write: {}", e);
                 }
                 if let Err(e) = writer.flush() {
@@ -142,13 +237,20 @@ impl SipHoneypot {
     async fn handle_packet(&self, buf: &[u8], client_addr: SocketAddr) {
         let packet_str = String::from_utf8_lossy(buf);
         
-        // Log full packet in verbose mode
+        // Log full packet in verbose mode (avec filtrage)
         if self.verbose {
             self.log_verbose(&client_addr, "RAW PACKET", &packet_str).await;
         }
         
+        // Version filtrée pour l'analyse SIP
+        let check_packet = if self.raw_display {
+            packet_str.to_string()
+        } else {
+            filter_printable_chars(&packet_str)
+        };
+        
         // Check if it's SIP
-        if Self::is_sip_packet(&packet_str) {
+        if Self::is_sip_packet(&check_packet) {
             self.log(&client_addr, &format!("SIP packet received ({} bytes)", buf.len())).await;
             
             // Extract and log authentication attempts in verbose mode
@@ -157,7 +259,7 @@ impl SipHoneypot {
             }
             
             // Analyze SIP method
-            if let Some(method) = Self::parse_sip_method(&packet_str) {
+            if let Some(method) = Self::parse_sip_method(&check_packet) {
                 self.log(&client_addr, &format!("SIP method detected: {}", method)).await;
                 
                 // Respond according to method
@@ -212,7 +314,6 @@ impl SipHoneypot {
         if let Some(auth_header) = Self::extract_authorization_header(packet) {
             auth_info.push(format!("Authorization: {}", auth_header));
             
-            // Parse digest authentication
             if let Some(username) = Self::extract_auth_username(packet) {
                 auth_info.push(format!("Auth Username: {}", username));
             }
@@ -264,7 +365,8 @@ impl SipHoneypot {
         }
     }
     
-    // New extraction methods for authentication - CORRECTED REGEX PATTERNS
+    // ==================== MÉTHODES D'EXTRACTION SIP ====================
+    
     fn extract_authorization_header(packet: &str) -> Option<String> {
         let re = Regex::new(r"(?i)Authorization:\s*(.*?)\r\n").unwrap();
         re.captures(packet)
@@ -342,7 +444,8 @@ impl SipHoneypot {
             .map(|m| m.as_str().to_string())
     }
     
-    // SIP information extraction methods
+    // ==================== MÉTHODES D'ANALYSE SIP ====================
+    
     fn is_sip_packet(packet: &str) -> bool {
         lazy_static! {
             static ref SIP_REGEX: Regex = Regex::new(r"^(REGISTER|INVITE|ACK|BYE|CANCEL|OPTIONS|SUBSCRIBE|NOTIFY|PUBLISH|MESSAGE|REFER|INFO|PRACK|UPDATE|SIP/2\.0)").unwrap();
@@ -364,19 +467,18 @@ impl SipHoneypot {
         }
     }
     
+    // ==================== GESTIONNAIRES DE MÉTHODES SIP ====================
+    
     async fn handle_register(&self, packet: &str, client_addr: &SocketAddr) -> String {
         self.log(client_addr, "Processing REGISTER request").await;
         
-        // Extract user from packet
         let user = Self::extract_user_from_packet(packet).unwrap_or_else(|| "unknown".to_string());
         
-        // In verbose mode, log registration attempt details
         if self.verbose {
             self.log_verbose(client_addr, "REGISTER ATTEMPT", 
                 &format!("User attempting to register: {}", user)).await;
         }
         
-        // Simulate successful registration - no honeypot info
         format!("SIP/2.0 200 OK\r\n\
                 Via: {}\r\n\
                 From: <sip:{}@pbx>\r\n\
@@ -395,21 +497,18 @@ impl SipHoneypot {
     async fn handle_invite(&self, packet: &str, client_addr: &SocketAddr) -> String {
         self.log(client_addr, "Processing INVITE request (call simulation)").await;
         
-        // Extract necessary information
         let to_number = Self::extract_to_number(packet).unwrap_or_else(|| "100".to_string());
         let from_header = Self::extract_from_header(packet).unwrap_or_else(|| "<sip:attacker@unknown>".to_string());
         let via_header = Self::extract_via_header(packet).unwrap_or_else(|| "SIP/2.0/UDP pbx:5060".to_string());
         let call_id = Self::extract_call_id(packet).unwrap_or_else(|| "12345".to_string());
         let cseq = Self::extract_cseq_number(packet).unwrap_or(1);
         
-        // In verbose mode, log call attempt details
         if self.verbose {
             self.log_verbose(client_addr, "INVITE ATTEMPT",
                 &format!("Call from: {}\nCall to: {}\nCall-ID: {}", 
                     from_header, to_number, call_id)).await;
         }
         
-        // Clone data needed for thread
         let honeypot_clone = self.clone();
         let client_addr_clone = client_addr.clone();
         let to_number_clone = to_number.clone();
@@ -417,7 +516,6 @@ impl SipHoneypot {
         let via_header_clone = via_header.clone();
         let call_id_clone = call_id.clone();
         
-        // Immediate ring simulation
         let ring_response = format!("SIP/2.0 180 Ringing\r\n\
                 Via: {}\r\n\
                 From: {}\r\n\
@@ -431,11 +529,9 @@ impl SipHoneypot {
                 call_id,
                 cseq);
         
-        // Start thread to simulate answer after 2 seconds
         tokio::spawn(async move {
             time::sleep(time::Duration::from_secs(2)).await;
             
-            // Send 200 OK to simulate answer
             let ok_response = format!("SIP/2.0 200 OK\r\n\
                     Via: {}\r\n\
                     From: {}\r\n\
@@ -545,7 +641,8 @@ impl SipHoneypot {
          Content-Length: 0\r\n\r\n".to_string()
     }
     
-    // SIP information extraction methods
+    // ==================== MÉTHODES D'EXTRACTION D'EN-TÊTES ====================
+    
     fn extract_user_from_packet(packet: &str) -> Option<String> {
         let re = Regex::new(r"(?i)From:\s*[^<]*<sip:([^@>]+)").unwrap();
         re.captures(packet)
@@ -603,7 +700,7 @@ impl SipHoneypot {
     }
     
     async fn run(self: Arc<Self>) -> Result<()> {
-        let mut buf = [0u8; 65536]; // Maximum size for UDP
+        let mut buf = [0u8; 65536];
         
         println!("[INFO] Waiting for UDP packets...");
         
@@ -620,14 +717,13 @@ impl SipHoneypot {
                 Ok(Err(e)) => {
                     eprintln!("[ERROR] Receive: {}", e);
                 }
-                Err(_) => {
-                    // Timeout - no data received in 5 seconds
-                    // Normal for a waiting server
-                }
+                Err(_) => {}
             }
         }
     }
 }
+
+// ==================== GESTION DU MODE DAEMON ====================
 
 #[cfg(unix)]
 fn daemonize() -> Result<()> {
@@ -659,7 +755,6 @@ fn daemonize() -> Result<()> {
 fn daemonize() -> Result<()> {
     println!("[INFO] Daemon mode not fully supported on Windows");
     println!("[INFO] Continuing in background...");
-    
     Ok(())
 }
 
@@ -668,6 +763,8 @@ fn daemonize() -> Result<()> {
     println!("[INFO] Daemon mode not supported on this platform");
     Ok(())
 }
+
+// ==================== POINT D'ENTRÉE PRINCIPAL ====================
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -699,6 +796,7 @@ async fn main() -> Result<()> {
     // Save log file path before moving opt
     let log_file = opt.log_file.clone();
     let verbose = opt.verbose;
+    let raw_display = opt.raw_display;
     
     // Start in daemon mode if requested
     if opt.daemon {
@@ -706,12 +804,13 @@ async fn main() -> Result<()> {
     }
     
     // Create and start honeypot
-    let honeypot = Arc::new(SipHoneypot::new(&opt.address, opt.port, log_file, verbose).await?);
+    let honeypot = Arc::new(SipHoneypot::new(&opt.address, opt.port, log_file, verbose, raw_display).await?);
     
     println!("[INFO] SIP honeypot started");
     println!("[INFO] Address: {}:{}", opt.address, opt.port);
     println!("[INFO] Daemon mode: {}", opt.daemon);
     println!("[INFO] Verbose mode: {}", opt.verbose);
+    println!("[INFO] Raw display mode: {}", opt.raw_display);
     println!("[INFO] Waiting for connections...");
     println!("[INFO] Press Ctrl+C to stop");
     
