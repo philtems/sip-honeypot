@@ -17,3 +17,12 @@ regex = "1.9"
 [target.'cfg(unix)'.dependencies]
 daemonize = "0.5.0"
 libc = "0.2"
+
+[profile.release]
+codegen-units = 1           # reduces binary size by ~2%
+lto = true                  # reduces binary size by ~14%
+opt-level = "s"             # reduces binary size by ~25%
+panic = "abort"             # reduces binary size by ~50% in combination with -Zbuild-std-features=panic_immediate_abort
+split-debuginfo = "packed"  # generates a separate *.dwp/*.dSYM so the binary can get stripped
+strip = "symbols"           # See split-debuginfo - allows us to drop the size by ~65%
+incremental = true          # Improves re-compile times

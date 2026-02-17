@@ -108,6 +108,7 @@ struct Opt {
 struct SipHoneypot {
     socket: Arc<UdpSocket>,
     log_writer: Option<Arc<Mutex<BufWriter<File>>>>,
+    log_path: Option<PathBuf>,  // Stocker le chemin pour les messages d'erreur
     verbose: bool,
     raw_display: bool,
 }
@@ -118,32 +119,43 @@ impl SipHoneypot {
         let socket = UdpSocket::bind(&bind_addr).await
             .with_context(|| format!("Failed to bind to {}", bind_addr))?;
         
-        println!("[INFO] SIP honeypot server started on {}", bind_addr);
+        // Utiliser eprintln pour que les messages aillent dans les logs système en mode daemon
+        eprintln!("[INFO] SIP honeypot server started on {}", bind_addr);
         if verbose {
-            println!("[INFO] Verbose mode enabled - SIP details will be logged");
+            eprintln!("[INFO] Verbose mode enabled - SIP details will be logged");
         }
         if raw_display {
-            println!("[WARNING] Raw display enabled - Terminal may be affected by control characters");
+            eprintln!("[WARNING] Raw display enabled - Terminal may be affected by control characters");
         } else {
-            println!("[INFO] Display filtering enabled - Control characters are sanitized");
+            eprintln!("[INFO] Display filtering enabled - Control characters are sanitized");
         }
         
         let log_writer = if let Some(path) = &log_file {
+            // Créer le répertoire parent si nécessaire
+            if let Some(parent) = path.parent() {
+                if !parent.exists() {
+                    std::fs::create_dir_all(parent)
+                        .with_context(|| format!("Failed to create log directory: {:?}", parent))?;
+                }
+            }
+            
             let file = OpenOptions::new()
                 .create(true)
                 .append(true)
                 .open(path)
                 .with_context(|| format!("Failed to open log file: {:?}", path))?;
-            println!("[INFO] Logging enabled to: {:?}", path);
+            
+            eprintln!("[INFO] Logging enabled to: {:?}", path);
             Some(Arc::new(Mutex::new(BufWriter::new(file))))
         } else {
-            println!("[INFO] Logging disabled (use -l to enable)");
+            eprintln!("[INFO] Logging disabled (use -l to enable)");
             None
         };
         
         Ok(Self {
             socket: Arc::new(socket),
             log_writer,
+            log_path: log_file,
             verbose,
             raw_display,
         })
@@ -173,10 +185,10 @@ impl SipHoneypot {
             let mut writer = writer.lock().await;
             let file_line = format!("{} {} {}\n", timestamp, client_addr, message);
             if let Err(e) = writer.write_all(file_line.as_bytes()) {
-                eprintln!("[ERROR] Log write: {}", e);
+                eprintln!("[ERROR] Log write to {:?}: {}", self.log_path, e);
             }
             if let Err(e) = writer.flush() {
-                eprintln!("[ERROR] Log flush: {}", e);
+                eprintln!("[ERROR] Log flush to {:?}: {}", self.log_path, e);
             }
         }
     }
@@ -702,7 +714,7 @@ impl SipHoneypot {
     async fn run(self: Arc<Self>) -> Result<()> {
         let mut buf = [0u8; 65536];
         
-        println!("[INFO] Waiting for UDP packets...");
+        eprintln!("[INFO] Waiting for UDP packets...");
         
         loop {
             match time::timeout(time::Duration::from_secs(5), self.socket.recv_from(&mut buf)).await {
@@ -729,7 +741,7 @@ impl SipHoneypot {
 fn daemonize() -> Result<()> {
     use daemonize::Daemonize;
     
-    println!("[INFO] Starting daemon mode...");
+    eprintln!("[INFO] Starting daemon mode...");
     
     let daemonize = Daemonize::new()
         .pid_file("/tmp/sip-honeypot.pid")
@@ -741,7 +753,8 @@ fn daemonize() -> Result<()> {
     
     match daemonize.start() {
         Ok(_) => {
-            println!("[INFO] SIP honeypot daemon started successfully");
+            // Après daemonization, plus de console - utiliser eprintln pour les logs système
+            eprintln!("[INFO] SIP honeypot daemon started successfully");
             Ok(())
         }
         Err(e) => {
@@ -753,14 +766,14 @@ fn daemonize() -> Result<()> {
 
 #[cfg(windows)]
 fn daemonize() -> Result<()> {
-    println!("[INFO] Daemon mode not fully supported on Windows");
-    println!("[INFO] Continuing in background...");
+    eprintln!("[INFO] Daemon mode not fully supported on Windows");
+    eprintln!("[INFO] Continuing in background...");
     Ok(())
 }
 
 #[cfg(not(any(unix, windows)))]
 fn daemonize() -> Result<()> {
-    println!("[INFO] Daemon mode not supported on this platform");
+    eprintln!("[INFO] Daemon mode not supported on this platform");
     Ok(())
 }
 
@@ -786,36 +799,49 @@ async fn main() -> Result<()> {
         return Ok(());
     }
     
-    // Show startup information
-    println!("==========================================");
-    println!("SIP Honeypot v{}", env!("CARGO_PKG_VERSION"));
-    println!("{}", env!("CARGO_PKG_AUTHORS"));
-    println!("{}", env!("CARGO_PKG_REPOSITORY"));
-    println!("==========================================");
+    // Afficher le banner seulement en mode non-daemon
+    if !opt.daemon {
+        println!("==========================================");
+        println!("SIP Honeypot v{}", env!("CARGO_PKG_VERSION"));
+        println!("{}", env!("CARGO_PKG_AUTHORS"));
+        println!("{}", env!("CARGO_PKG_REPOSITORY"));
+        println!("==========================================");
+    }
     
-    // Save log file path before moving opt
+    // Sauvegarder les paramètres avant daemonization
+    let address = opt.address.clone();
+    let port = opt.port;
     let log_file = opt.log_file.clone();
     let verbose = opt.verbose;
     let raw_display = opt.raw_display;
     
-    // Start in daemon mode if requested
+    // Démarrer le mode daemon SI demandé (AVANT d'ouvrir le fichier log)
     if opt.daemon {
         daemonize()?;
+        // Après daemonization, on est sous l'utilisateur "nobody"
     }
     
-    // Create and start honeypot
-    let honeypot = Arc::new(SipHoneypot::new(&opt.address, opt.port, log_file, verbose, raw_display).await?);
+    // Créer et démarrer le honeypot APRÈS daemonization
+    // Le fichier log sera ouvert avec les droits de "nobody"
+    let honeypot = Arc::new(SipHoneypot::new(&address, port, log_file, verbose, raw_display).await?);
     
-    println!("[INFO] SIP honeypot started");
-    println!("[INFO] Address: {}:{}", opt.address, opt.port);
-    println!("[INFO] Daemon mode: {}", opt.daemon);
-    println!("[INFO] Verbose mode: {}", opt.verbose);
-    println!("[INFO] Raw display mode: {}", opt.raw_display);
-    println!("[INFO] Waiting for connections...");
-    println!("[INFO] Press Ctrl+C to stop");
+    // Afficher les infos de démarrage seulement en mode non-daemon
+    if !opt.daemon {
+        println!("[INFO] SIP honeypot started");
+        println!("[INFO] Address: {}:{}", address, port);
+        println!("[INFO] Daemon mode: {}", opt.daemon);
+        println!("[INFO] Verbose mode: {}", verbose);
+        println!("[INFO] Raw display mode: {}", raw_display);
+        println!("[INFO] Waiting for connections...");
+        println!("[INFO] Press Ctrl+C to stop");
+    } else {
+        // En mode daemon, utiliser eprintln pour les logs système
+        eprintln!("[INFO] SIP honeypot running in background");
+    }
     
-    // Start server
+    // Démarrer le serveur
     honeypot.run().await?;
     
     Ok(())
 }
+
