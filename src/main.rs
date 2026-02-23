@@ -1,10 +1,11 @@
 use std::fs::{File, OpenOptions};
 use std::io::{Write, BufWriter};
 use std::net::SocketAddr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::os::unix::fs::PermissionsExt;
 
-use anyhow::{Result, Context};
+use anyhow::{Result, Context, bail};
 use chrono::Local;
 use lazy_static::lazy_static;
 use regex::Regex;
@@ -24,19 +25,6 @@ fn filter_printable_chars(input: &str) -> String {
             *c == '\n' || 
             *c == '\r' || 
             *c == '\t'
-        })
-        .collect()
-}
-
-/// Remplace les caractères non imprimables par �
-fn filter_safe_display(input: &str) -> String {
-    input.chars()
-        .map(|c| {
-            if c.is_ascii_graphic() || c.is_ascii_whitespace() || c == '\n' || c == '\r' {
-                c
-            } else {
-                '�'
-            }
         })
         .collect()
 }
@@ -68,7 +56,7 @@ fn safe_log_string(input: &str) -> String {
     name = "sip-honeypot",
     about = "A SIP honeypot for detecting and analyzing SIP attacks",
     author = "2026, Philippe TEMESI <https://www.tems.be>",
-    version = "0.1.0"
+    version = "0.1.1"
 )]
 struct Opt {
     /// Run as daemon
@@ -79,7 +67,7 @@ struct Opt {
     #[structopt(short = "p", long = "port", default_value = "5060")]
     port: u16,
     
-    /// Log file
+    /// Log file (if not specified, logs to stdout only)
     #[structopt(short = "l", long = "log", parse(from_os_str))]
     log_file: Option<PathBuf>,
     
@@ -87,7 +75,7 @@ struct Opt {
     #[structopt(short = "a", long = "address", default_value = "0.0.0.0")]
     address: String,
     
-    /// Verbose mode - display SIP details (phone numbers, login, password attempts)
+    /// Verbose mode - display SIP details
     #[structopt(short = "v", long = "verbose")]
     verbose: bool,
     
@@ -95,43 +83,41 @@ struct Opt {
     #[structopt(short = "r", long = "raw")]
     raw_display: bool,
     
-    /// Show help
-    #[structopt(short = "h", long = "help")]
-    help: bool,
-    
-    /// Show version
-    #[structopt(short = "V", long = "version")]
-    version: bool,
+    /// PID file (default: /tmp/sip-honeypot.pid)
+    #[structopt(long = "pidfile", default_value = "/tmp/sip-honeypot.pid")]
+    pid_file: String,
 }
+
+// ==================== HONEYPOT PRINCIPAL ====================
 
 #[derive(Clone)]
 struct SipHoneypot {
     socket: Arc<UdpSocket>,
     log_writer: Option<Arc<Mutex<BufWriter<File>>>>,
-    log_path: Option<PathBuf>,  // Stocker le chemin pour les messages d'erreur
+    log_path: Option<PathBuf>,
     verbose: bool,
     raw_display: bool,
+    daemon_mode: bool,
 }
 
 impl SipHoneypot {
-    async fn new(addr: &str, port: u16, log_file: Option<PathBuf>, verbose: bool, raw_display: bool) -> Result<Self> {
-        let bind_addr = format!("{}:{}", addr, port);
+    async fn new(opt: &Opt, daemon_mode: bool) -> Result<Self> {
+        let bind_addr = format!("{}:{}", opt.address, opt.port);
+        
+        // Création du socket UDP
         let socket = UdpSocket::bind(&bind_addr).await
             .with_context(|| format!("Failed to bind to {}", bind_addr))?;
         
-        // Utiliser eprintln pour que les messages aillent dans les logs système en mode daemon
-        eprintln!("[INFO] SIP honeypot server started on {}", bind_addr);
-        if verbose {
-            eprintln!("[INFO] Verbose mode enabled - SIP details will be logged");
-        }
-        if raw_display {
-            eprintln!("[WARNING] Raw display enabled - Terminal may be affected by control characters");
+        let local_addr = socket.local_addr()?;
+        
+        if daemon_mode {
+            eprintln!("[INFO] SIP honeypot listening on {}", local_addr);
         } else {
-            eprintln!("[INFO] Display filtering enabled - Control characters are sanitized");
+            println!("[INFO] SIP honeypot listening on {}", local_addr);
         }
         
-        let log_writer = if let Some(path) = &log_file {
-            // Créer le répertoire parent si nécessaire
+        // Gestion du fichier de log
+        let log_writer = if let Some(path) = &opt.log_file {
             if let Some(parent) = path.parent() {
                 if !parent.exists() {
                     std::fs::create_dir_all(parent)
@@ -145,26 +131,35 @@ impl SipHoneypot {
                 .open(path)
                 .with_context(|| format!("Failed to open log file: {:?}", path))?;
             
-            eprintln!("[INFO] Logging enabled to: {:?}", path);
+            if daemon_mode {
+                eprintln!("[INFO] Logging enabled to: {:?}", path);
+            } else {
+                println!("[INFO] Logging enabled to: {:?}", path);
+            }
+            
             Some(Arc::new(Mutex::new(BufWriter::new(file))))
         } else {
-            eprintln!("[INFO] Logging disabled (use -l to enable)");
+            if daemon_mode {
+                eprintln!("[INFO] Logging to syslog only");
+            } else {
+                println!("[INFO] Logging to stdout only");
+            }
             None
         };
         
         Ok(Self {
             socket: Arc::new(socket),
             log_writer,
-            log_path: log_file,
-            verbose,
-            raw_display,
+            log_path: opt.log_file.clone(),
+            verbose: opt.verbose,
+            raw_display: opt.raw_display,
+            daemon_mode,
         })
     }
     
     async fn log(&self, client_addr: &SocketAddr, message: &str) {
         let timestamp = Local::now().format("%Y-%m-%d %H:%M:%S%.3f");
         
-        // Filtrer le message pour l'affichage
         let display_message = if self.raw_display {
             message.to_string()
         } else {
@@ -173,14 +168,11 @@ impl SipHoneypot {
         
         let log_line = format!("{} {} {}\n", timestamp, client_addr, display_message);
         
-        // Affichage console (filtré ou raw selon option)
-        if self.raw_display {
+        if !self.daemon_mode || self.verbose {
             print!("{}", log_line);
-        } else {
-            print!("{}", filter_printable_chars(&log_line));
+            let _ = std::io::stdout().flush();
         }
         
-        // Écriture fichier (toujours en version originale pour conserver les données)
         if let Some(writer) = &self.log_writer {
             let mut writer = writer.lock().await;
             let file_line = format!("{} {} {}\n", timestamp, client_addr, message);
@@ -198,7 +190,6 @@ impl SipHoneypot {
             let timestamp = Local::now().format("%Y-%m-%d %H:%M:%S%.3f");
             let separator = "─".repeat(60);
             
-            // Version filtrée pour l'affichage console
             let display_details = if self.raw_display {
                 details.to_string()
             } else {
@@ -216,14 +207,11 @@ impl SipHoneypot {
                 separator
             );
             
-            // Affichage console
-            if self.raw_display {
+            if !self.daemon_mode || self.verbose {
                 print!("{}", verbose_log);
-            } else {
-                print!("{}", filter_printable_chars(&verbose_log));
+                let _ = std::io::stdout().flush();
             }
             
-            // Écriture fichier (version safe)
             if let Some(writer) = &self.log_writer {
                 let mut writer = writer.lock().await;
                 let file_log = format!(
@@ -249,32 +237,26 @@ impl SipHoneypot {
     async fn handle_packet(&self, buf: &[u8], client_addr: SocketAddr) {
         let packet_str = String::from_utf8_lossy(buf);
         
-        // Log full packet in verbose mode (avec filtrage)
         if self.verbose {
             self.log_verbose(&client_addr, "RAW PACKET", &packet_str).await;
         }
         
-        // Version filtrée pour l'analyse SIP
         let check_packet = if self.raw_display {
             packet_str.to_string()
         } else {
             filter_printable_chars(&packet_str)
         };
         
-        // Check if it's SIP
         if Self::is_sip_packet(&check_packet) {
             self.log(&client_addr, &format!("SIP packet received ({} bytes)", buf.len())).await;
             
-            // Extract and log authentication attempts in verbose mode
             if self.verbose {
                 self.extract_and_log_auth_info(&client_addr, &packet_str).await;
             }
             
-            // Analyze SIP method
             if let Some(method) = Self::parse_sip_method(&check_packet) {
                 self.log(&client_addr, &format!("SIP method detected: {}", method)).await;
                 
-                // Respond according to method
                 let response = match method.as_str() {
                     "REGISTER" => self.handle_register(&packet_str, &client_addr).await,
                     "INVITE" => self.handle_invite(&packet_str, &client_addr).await,
@@ -287,7 +269,6 @@ impl SipHoneypot {
                 };
                 
                 if !response.is_empty() {
-                    // Log response in verbose mode
                     if self.verbose {
                         self.log_verbose(&client_addr, "RESPONSE", &response).await;
                     }
@@ -309,7 +290,6 @@ impl SipHoneypot {
     async fn extract_and_log_auth_info(&self, client_addr: &SocketAddr, packet: &str) {
         let mut auth_info = Vec::new();
         
-        // Extract user/phone number
         if let Some(user) = Self::extract_user_from_packet(packet) {
             auth_info.push(format!("User/Phone: {}", user));
         }
@@ -322,7 +302,6 @@ impl SipHoneypot {
             auth_info.push(format!("From user: {}", from));
         }
         
-        // Extract authentication information
         if let Some(auth_header) = Self::extract_authorization_header(packet) {
             auth_info.push(format!("Authorization: {}", auth_header));
             
@@ -334,41 +313,13 @@ impl SipHoneypot {
                 auth_info.push(format!("Auth Realm: {}", realm));
             }
             
-            if let Some(nonce) = Self::extract_auth_nonce(packet) {
-                auth_info.push(format!("Auth Nonce: {}", nonce));
-            }
-            
-            if let Some(uri) = Self::extract_auth_uri(packet) {
-                auth_info.push(format!("Auth URI: {}", uri));
-            }
-            
             if let Some(response) = Self::extract_auth_response(packet) {
                 auth_info.push(format!("Auth Response (hash): {}", response));
             }
-            
-            if let Some(algorithm) = Self::extract_auth_algorithm(packet) {
-                auth_info.push(format!("Auth Algorithm: {}", algorithm));
-            }
         }
         
-        // Extract Proxy-Authorization
-        if let Some(proxy_auth) = Self::extract_proxy_authorization_header(packet) {
-            auth_info.push(format!("Proxy-Authorization: {}", proxy_auth));
-        }
-        
-        // Extract Contact info
-        if let Some(contact) = Self::extract_contact_header(packet) {
-            auth_info.push(format!("Contact: {}", contact));
-        }
-        
-        // Extract User-Agent
         if let Some(user_agent) = Self::extract_user_agent(packet) {
             auth_info.push(format!("User-Agent: {}", user_agent));
-        }
-        
-        // Extract IP addresses from headers
-        if let Some(via) = Self::extract_via_header(packet) {
-            auth_info.push(format!("Via: {}", via));
         }
         
         if !auth_info.is_empty() {
@@ -381,20 +332,6 @@ impl SipHoneypot {
     
     fn extract_authorization_header(packet: &str) -> Option<String> {
         let re = Regex::new(r"(?i)Authorization:\s*(.*?)\r\n").unwrap();
-        re.captures(packet)
-            .and_then(|caps| caps.get(1))
-            .map(|m| m.as_str().trim().to_string())
-    }
-    
-    fn extract_proxy_authorization_header(packet: &str) -> Option<String> {
-        let re = Regex::new(r"(?i)Proxy-Authorization:\s*(.*?)\r\n").unwrap();
-        re.captures(packet)
-            .and_then(|caps| caps.get(1))
-            .map(|m| m.as_str().trim().to_string())
-    }
-    
-    fn extract_contact_header(packet: &str) -> Option<String> {
-        let re = Regex::new(r"(?i)Contact:\s*(.*?)\r\n").unwrap();
         re.captures(packet)
             .and_then(|caps| caps.get(1))
             .map(|m| m.as_str().trim().to_string())
@@ -421,20 +358,6 @@ impl SipHoneypot {
             .map(|m| m.as_str().to_string())
     }
     
-    fn extract_auth_nonce(packet: &str) -> Option<String> {
-        let re = Regex::new("(?i)nonce=\"?([^\",]+)\"?").unwrap();
-        re.captures(packet)
-            .and_then(|caps| caps.get(1))
-            .map(|m| m.as_str().to_string())
-    }
-    
-    fn extract_auth_uri(packet: &str) -> Option<String> {
-        let re = Regex::new("(?i)uri=\"?([^\",]+)\"?").unwrap();
-        re.captures(packet)
-            .and_then(|caps| caps.get(1))
-            .map(|m| m.as_str().to_string())
-    }
-    
     fn extract_auth_response(packet: &str) -> Option<String> {
         let re = Regex::new("(?i)response=\"?([^\",]+)\"?").unwrap();
         re.captures(packet)
@@ -442,15 +365,50 @@ impl SipHoneypot {
             .map(|m| m.as_str().to_string())
     }
     
-    fn extract_auth_algorithm(packet: &str) -> Option<String> {
-        let re = Regex::new("(?i)algorithm=\"?([^\",]+)\"?").unwrap();
+    fn extract_from_user(packet: &str) -> Option<String> {
+        let re = Regex::new(r"(?i)From:\s*[^<]*<sip:([^@>]+)").unwrap();
         re.captures(packet)
             .and_then(|caps| caps.get(1))
             .map(|m| m.as_str().to_string())
     }
     
-    fn extract_from_user(packet: &str) -> Option<String> {
-        let re = Regex::new(r"(?i)From:\s*[^<]*<sip:([^@>]+)").unwrap();
+    fn extract_via_header(packet: &str) -> Option<String> {
+        let re = Regex::new(r"(?i)Via:\s*(.*?)\r\n").unwrap();
+        re.captures(packet)
+            .and_then(|caps| caps.get(1))
+            .map(|m| m.as_str().to_string())
+    }
+    
+    fn extract_call_id(packet: &str) -> Option<String> {
+        let re = Regex::new(r"(?i)Call-ID:\s*(.*?)\r\n").unwrap();
+        re.captures(packet)
+            .and_then(|caps| caps.get(1))
+            .map(|m| m.as_str().to_string())
+    }
+    
+    fn extract_from_header(packet: &str) -> Option<String> {
+        let re = Regex::new(r"(?i)From:\s*(.*?)\r\n").unwrap();
+        re.captures(packet)
+            .and_then(|caps| caps.get(1))
+            .map(|m| m.as_str().to_string())
+    }
+    
+    fn extract_to_header(packet: &str) -> Option<String> {
+        let re = Regex::new(r"(?i)To:\s*(.*?)\r\n").unwrap();
+        re.captures(packet)
+            .and_then(|caps| caps.get(1))
+            .map(|m| m.as_str().to_string())
+    }
+    
+    fn extract_cseq_number(packet: &str) -> Option<u32> {
+        let re = Regex::new(r"(?i)CSeq:\s*(\d+)").unwrap();
+        re.captures(packet)
+            .and_then(|caps| caps.get(1))
+            .and_then(|m| m.as_str().parse().ok())
+    }
+    
+    fn extract_to_number(packet: &str) -> Option<String> {
+        let re = Regex::new(r"(?i)To:\s*[^<]*<sip:([^@>]+)").unwrap();
         re.captures(packet)
             .and_then(|caps| caps.get(1))
             .map(|m| m.as_str().to_string())
@@ -653,7 +611,12 @@ impl SipHoneypot {
          Content-Length: 0\r\n\r\n".to_string()
     }
     
-    // ==================== MÉTHODES D'EXTRACTION D'EN-TÊTES ====================
+    fn extract_status_code(packet: &str) -> Option<u16> {
+        let re = Regex::new(r"SIP/2\.0\s+(\d{3})").unwrap();
+        re.captures(packet)
+            .and_then(|caps| caps.get(1))
+            .and_then(|m| m.as_str().parse().ok())
+    }
     
     fn extract_user_from_packet(packet: &str) -> Option<String> {
         let re = Regex::new(r"(?i)From:\s*[^<]*<sip:([^@>]+)").unwrap();
@@ -662,184 +625,181 @@ impl SipHoneypot {
             .map(|m| m.as_str().to_string())
     }
     
-    fn extract_via_header(packet: &str) -> Option<String> {
-        let re = Regex::new(r"(?i)Via:\s*(.*?)\r\n").unwrap();
-        re.captures(packet)
-            .and_then(|caps| caps.get(1))
-            .map(|m| m.as_str().to_string())
-    }
-    
-    fn extract_call_id(packet: &str) -> Option<String> {
-        let re = Regex::new(r"(?i)Call-ID:\s*(.*?)\r\n").unwrap();
-        re.captures(packet)
-            .and_then(|caps| caps.get(1))
-            .map(|m| m.as_str().to_string())
-    }
-    
-    fn extract_from_header(packet: &str) -> Option<String> {
-        let re = Regex::new(r"(?i)From:\s*(.*?)\r\n").unwrap();
-        re.captures(packet)
-            .and_then(|caps| caps.get(1))
-            .map(|m| m.as_str().to_string())
-    }
-    
-    fn extract_to_header(packet: &str) -> Option<String> {
-        let re = Regex::new(r"(?i)To:\s*(.*?)\r\n").unwrap();
-        re.captures(packet)
-            .and_then(|caps| caps.get(1))
-            .map(|m| m.as_str().to_string())
-    }
-    
-    fn extract_cseq_number(packet: &str) -> Option<u32> {
-        let re = Regex::new(r"(?i)CSeq:\s*(\d+)").unwrap();
-        re.captures(packet)
-            .and_then(|caps| caps.get(1))
-            .and_then(|m| m.as_str().parse().ok())
-    }
-    
-    fn extract_to_number(packet: &str) -> Option<String> {
-        let re = Regex::new(r"(?i)To:\s*[^<]*<sip:([^@>]+)").unwrap();
-        re.captures(packet)
-            .and_then(|caps| caps.get(1))
-            .map(|m| m.as_str().to_string())
-    }
-    
-    fn extract_status_code(packet: &str) -> Option<u16> {
-        let re = Regex::new(r"SIP/2\.0\s+(\d{3})").unwrap();
-        re.captures(packet)
-            .and_then(|caps| caps.get(1))
-            .and_then(|m| m.as_str().parse().ok())
-    }
-    
     async fn run(self: Arc<Self>) -> Result<()> {
         let mut buf = [0u8; 65536];
         
-        eprintln!("[INFO] Waiting for UDP packets...");
+        if !self.daemon_mode {
+            println!("[INFO] Waiting for UDP packets...");
+        } else {
+            eprintln!("[INFO] Waiting for UDP packets...");
+        }
+        
+        let local_addr = self.socket.local_addr()?;
+        if !self.daemon_mode {
+            println!("[INFO] Listening on: {}", local_addr);
+        } else {
+            eprintln!("[INFO] Listening on: {}", local_addr);
+        }
+        
+        let mut packet_count = 0;
         
         loop {
-            match time::timeout(time::Duration::from_secs(5), self.socket.recv_from(&mut buf)).await {
-                Ok(Ok((len, client_addr))) => {
+            match self.socket.recv_from(&mut buf).await {
+                Ok((len, client_addr)) => {
+                    packet_count += 1;
                     let packet = buf[..len].to_vec();
                     let honeypot = self.clone();
+                    
+                    if packet_count <= 5 && self.verbose && !self.daemon_mode {
+                        println!("[DEBUG] Packet #{} from {} ({} bytes)", 
+                                 packet_count, client_addr, len);
+                    }
                     
                     tokio::spawn(async move {
                         honeypot.handle_packet(&packet, client_addr).await;
                     });
                 }
-                Ok(Err(e)) => {
-                    eprintln!("[ERROR] Receive: {}", e);
+                Err(e) => {
+                    if !self.daemon_mode {
+                        eprintln!("[ERROR] Receive error: {}", e);
+                    }
+                    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
                 }
-                Err(_) => {}
             }
         }
     }
-}
-
-// ==================== GESTION DU MODE DAEMON ====================
-
-#[cfg(unix)]
-fn daemonize() -> Result<()> {
-    use daemonize::Daemonize;
-    
-    eprintln!("[INFO] Starting daemon mode...");
-    
-    let daemonize = Daemonize::new()
-        .pid_file("/tmp/sip-honeypot.pid")
-        .chown_pid_file(true)
-        .working_directory("/tmp")
-        .user("nobody")
-        .group("nogroup")
-        .umask(0o027);
-    
-    match daemonize.start() {
-        Ok(_) => {
-            // Après daemonization, plus de console - utiliser eprintln pour les logs système
-            eprintln!("[INFO] SIP honeypot daemon started successfully");
-            Ok(())
-        }
-        Err(e) => {
-            eprintln!("[ERROR] Daemon startup: {}", e);
-            Err(anyhow::anyhow!("Failed to start daemon mode"))
-        }
-    }
-}
-
-#[cfg(windows)]
-fn daemonize() -> Result<()> {
-    eprintln!("[INFO] Daemon mode not fully supported on Windows");
-    eprintln!("[INFO] Continuing in background...");
-    Ok(())
-}
-
-#[cfg(not(any(unix, windows)))]
-fn daemonize() -> Result<()> {
-    eprintln!("[INFO] Daemon mode not supported on this platform");
-    Ok(())
 }
 
 // ==================== POINT D'ENTRÉE PRINCIPAL ====================
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // Parse command line arguments
     let opt = Opt::from_args();
     
-    // Show version if requested
-    if opt.version {
-        println!("SIP Honeypot v{}", env!("CARGO_PKG_VERSION"));
-        println!("{}", env!("CARGO_PKG_AUTHORS"));
-        println!("{}", env!("CARGO_PKG_REPOSITORY"));
-        return Ok(());
+    // Afficher le banner
+    println!("==========================================");
+    println!("SIP Honeypot v{}", env!("CARGO_PKG_VERSION"));
+    println!("==========================================");
+    
+    // Vérifier le port
+    if opt.port < 1024 && opt.daemon {
+        eprintln!("[WARNING] Port {} is privileged. You might need root to bind.", opt.port);
     }
     
-    // Show help if requested
-    if opt.help {
-        Opt::clap().print_help()?;
-        println!();
-        return Ok(());
+    // Afficher les infos de l'utilisateur
+    eprintln!("[INFO] Starting as user: {}", 
+              std::env::var("USER").unwrap_or_else(|_| "unknown".to_string()));
+    eprintln!("[INFO] PID: {}", std::process::id());
+    eprintln!("[INFO] Working directory: {:?}", std::env::current_dir().unwrap());
+    
+    // Vérifier/Créer le répertoire pour le fichier de log AVANT daemonisation
+    if let Some(log_path) = &opt.log_file {
+        if let Some(parent) = log_path.parent() {
+            if !parent.exists() {
+                std::fs::create_dir_all(parent)?;
+                eprintln!("[INFO] Created log directory: {:?}", parent);
+            }
+        }
     }
     
-    // Afficher le banner seulement en mode non-daemon
-    if !opt.daemon {
-        println!("==========================================");
-        println!("SIP Honeypot v{}", env!("CARGO_PKG_VERSION"));
-        println!("{}", env!("CARGO_PKG_AUTHORS"));
-        println!("{}", env!("CARGO_PKG_REPOSITORY"));
-        println!("==========================================");
-    }
-    
-    // Sauvegarder les paramètres avant daemonization
-    let address = opt.address.clone();
-    let port = opt.port;
-    let log_file = opt.log_file.clone();
-    let verbose = opt.verbose;
-    let raw_display = opt.raw_display;
-    
-    // Démarrer le mode daemon SI demandé (AVANT d'ouvrir le fichier log)
+    // === DAEMONISATION DANS UN THREAD SÉPARÉ ===
     if opt.daemon {
-        daemonize()?;
-        // Après daemonization, on est sous l'utilisateur "nobody"
+        eprintln!("[INFO] Starting daemon mode...");
+        
+        use tokio::sync::oneshot;
+        let (tx, rx) = oneshot::channel();
+        
+        // Cloner opt pour le mouvement dans le thread
+        let opt_clone = opt.clone();
+        
+        std::thread::spawn(move || {
+            use daemonize::Daemonize;
+            use std::fs;
+            
+            // Daemonisation
+            let daemonize = Daemonize::new()
+                .pid_file(&opt_clone.pid_file)
+                .chown_pid_file(true)
+                .working_directory(".");  // Garde le répertoire courant
+            
+            match daemonize.start() {
+                Ok(_) => {
+                    // Dans le processus enfant
+                    let pid = std::process::id();
+                    
+                    // Écrire un fichier de test
+                    let _ = fs::write("/tmp/sip-honeypot-daemon-test.txt", 
+                                      format!("Child process started at PID {}\n", pid));
+                    
+                    // Tester la création d'un socket UDP simple
+                    use std::net::UdpSocket;
+                    match UdpSocket::bind("0.0.0.0:0") {
+                        Ok(_) => {
+                            let _ = fs::write("/tmp/sip-honeypot-socket-test.txt", 
+                                             "Socket test successful\n");
+                        }
+                        Err(e) => {
+                            let _ = fs::write("/tmp/sip-honeypot-socket-test.txt", 
+                                             format!("Socket test failed: {}\n", e));
+                        }
+                    }
+                    
+                    // Signaler au parent que la daemonisation a réussi
+                    let _ = tx.send(pid);
+                    
+                    // CRÉER UN NOUVEAU RUNTIME TOKIO DANS L'ENFANT
+                    let runtime = tokio::runtime::Runtime::new().unwrap();
+                    runtime.block_on(async {
+                        eprintln!("[INFO] Child process: creating SIP honeypot...");
+                        
+                        match SipHoneypot::new(&opt_clone, true).await {
+                            Ok(h) => {
+                                let honeypot = Arc::new(h);
+                                eprintln!("[INFO] Child process: honeypot created successfully");
+                                eprintln!("[INFO] Child process: starting main loop...");
+                                
+                                if let Err(e) = honeypot.run().await {
+                                    eprintln!("[ERROR] Child process: server error: {}", e);
+                                }
+                            }
+                            Err(e) => {
+                                eprintln!("[ERROR] Child process: failed to create honeypot: {}", e);
+                            }
+                        }
+                    });
+                }
+                Err(e) => {
+                    eprintln!("[ERROR] Daemon startup failed: {}", e);
+                    std::process::exit(1);
+                }
+            }
+        });
+        
+        // Attendre que le processus enfant signale qu'il est prêt
+        match rx.await {
+            Ok(pid) => {
+                eprintln!("[INFO] Daemon child process running (PID: {})", pid);
+                eprintln!("[INFO] Parent process exiting");
+                std::process::exit(0);
+            }
+            Err(_) => {
+                eprintln!("[ERROR] Daemon child failed to start");
+                std::process::exit(1);
+            }
+        }
     }
     
-    // Créer et démarrer le honeypot APRÈS daemonization
-    // Le fichier log sera ouvert avec les droits de "nobody"
-    let honeypot = Arc::new(SipHoneypot::new(&address, port, log_file, verbose, raw_display).await?);
+    // === MODE NORMAL (PAS DE DAEMON) ===
+    eprintln!("[INFO] Creating SIP honeypot instance...");
     
-    // Afficher les infos de démarrage seulement en mode non-daemon
-    if !opt.daemon {
-        println!("[INFO] SIP honeypot started");
-        println!("[INFO] Address: {}:{}", address, port);
-        println!("[INFO] Daemon mode: {}", opt.daemon);
-        println!("[INFO] Verbose mode: {}", verbose);
-        println!("[INFO] Raw display mode: {}", raw_display);
-        println!("[INFO] Waiting for connections...");
-        println!("[INFO] Press Ctrl+C to stop");
-    } else {
-        // En mode daemon, utiliser eprintln pour les logs système
-        eprintln!("[INFO] SIP honeypot running in background");
-    }
+    let honeypot = Arc::new(SipHoneypot::new(&opt, false).await?);
     
-    // Démarrer le serveur
+    println!("[INFO] SIP honeypot started in foreground");
+    println!("[INFO] PID: {}", std::process::id());
+    println!("[INFO] Address: {}:{}", opt.address, opt.port);
+    println!("[INFO] Waiting for UDP packets...");
+    println!("[INFO] Press Ctrl+C to stop");
+    
     honeypot.run().await?;
     
     Ok(())
