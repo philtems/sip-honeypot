@@ -1,11 +1,10 @@
 use std::fs::{File, OpenOptions};
 use std::io::{Write, BufWriter};
 use std::net::SocketAddr;
-use std::path::{Path, PathBuf};
+use std::path::{PathBuf};
 use std::sync::Arc;
-use std::os::unix::fs::PermissionsExt;
 
-use anyhow::{Result, Context, bail};
+use anyhow::{Result, Context};
 use chrono::Local;
 use lazy_static::lazy_static;
 use regex::Regex;
@@ -59,7 +58,7 @@ fn safe_log_string(input: &str) -> String {
     version = "0.1.1"
 )]
 struct Opt {
-    /// Run as daemon
+    /// Run as daemon (requires --log)
     #[structopt(short = "d", long = "daemon")]
     daemon: bool,
     
@@ -67,7 +66,7 @@ struct Opt {
     #[structopt(short = "p", long = "port", default_value = "5060")]
     port: u16,
     
-    /// Log file (if not specified, logs to stdout only)
+    /// Log file (MANDATORY in daemon mode)
     #[structopt(short = "l", long = "log", parse(from_os_str))]
     log_file: Option<PathBuf>,
     
@@ -110,9 +109,8 @@ impl SipHoneypot {
         
         let local_addr = socket.local_addr()?;
         
-        if daemon_mode {
-            eprintln!("[INFO] SIP honeypot listening on {}", local_addr);
-        } else {
+        // En mode daemon, on n'écrit PAS sur la console
+        if !daemon_mode {
             println!("[INFO] SIP honeypot listening on {}", local_addr);
         }
         
@@ -131,8 +129,9 @@ impl SipHoneypot {
                 .open(path)
                 .with_context(|| format!("Failed to open log file: {:?}", path))?;
             
+            // Message dans le log au démarrage
             if daemon_mode {
-                eprintln!("[INFO] Logging enabled to: {:?}", path);
+                // On écrira le message de démarrage plus tard dans run()
             } else {
                 println!("[INFO] Logging enabled to: {:?}", path);
             }
@@ -140,7 +139,8 @@ impl SipHoneypot {
             Some(Arc::new(Mutex::new(BufWriter::new(file))))
         } else {
             if daemon_mode {
-                eprintln!("[INFO] Logging to syslog only");
+                // En mode daemon, log_file est obligatoire, on ne devrait pas arriver ici
+                anyhow::bail!("Daemon mode requires a log file");
             } else {
                 println!("[INFO] Logging to stdout only");
             }
@@ -168,19 +168,26 @@ impl SipHoneypot {
         
         let log_line = format!("{} {} {}\n", timestamp, client_addr, display_message);
         
-        if !self.daemon_mode || self.verbose {
+        // En mode non-daemon, on affiche sur la console
+        if !self.daemon_mode {
             print!("{}", log_line);
             let _ = std::io::stdout().flush();
         }
         
+        // Toujours écrire dans le fichier de log s'il existe
         if let Some(writer) = &self.log_writer {
             let mut writer = writer.lock().await;
             let file_line = format!("{} {} {}\n", timestamp, client_addr, message);
             if let Err(e) = writer.write_all(file_line.as_bytes()) {
-                eprintln!("[ERROR] Log write to {:?}: {}", self.log_path, e);
+                // En mode daemon, pas de console, on ignore silencieusement
+                if !self.daemon_mode {
+                    eprintln!("[ERROR] Log write to {:?}: {}", self.log_path, e);
+                }
             }
             if let Err(e) = writer.flush() {
-                eprintln!("[ERROR] Log flush to {:?}: {}", self.log_path, e);
+                if !self.daemon_mode {
+                    eprintln!("[ERROR] Log flush to {:?}: {}", self.log_path, e);
+                }
             }
         }
     }
@@ -207,11 +214,13 @@ impl SipHoneypot {
                 separator
             );
             
-            if !self.daemon_mode || self.verbose {
+            // Afficher seulement en mode non-daemon
+            if !self.daemon_mode {
                 print!("{}", verbose_log);
                 let _ = std::io::stdout().flush();
             }
             
+            // Toujours écrire dans le fichier de log
             if let Some(writer) = &self.log_writer {
                 let mut writer = writer.lock().await;
                 let file_log = format!(
@@ -224,12 +233,8 @@ impl SipHoneypot {
                     safe_log_string(details),
                     separator
                 );
-                if let Err(e) = writer.write_all(file_log.as_bytes()) {
-                    eprintln!("[ERROR] Log write: {}", e);
-                }
-                if let Err(e) = writer.flush() {
-                    eprintln!("[ERROR] Log flush: {}", e);
-                }
+                let _ = writer.write_all(file_log.as_bytes());
+                let _ = writer.flush();
             }
         }
     }
@@ -628,17 +633,22 @@ impl SipHoneypot {
     async fn run(self: Arc<Self>) -> Result<()> {
         let mut buf = [0u8; 65536];
         
-        if !self.daemon_mode {
+        // Message de démarrage dans le log
+        if self.daemon_mode {
+            if let Some(writer) = &self.log_writer {
+                let mut writer = writer.lock().await;
+                let _ = writeln!(writer, 
+                    "=== SIP Honeypot daemon started at PID {} ===", 
+                    std::process::id());
+                let _ = writeln!(writer, 
+                    "=== Listening on {}:{} ===", 
+                    self.socket.local_addr()?.ip(),
+                    self.socket.local_addr()?.port());
+                let _ = writer.flush();
+            }
+        } else {
             println!("[INFO] Waiting for UDP packets...");
-        } else {
-            eprintln!("[INFO] Waiting for UDP packets...");
-        }
-        
-        let local_addr = self.socket.local_addr()?;
-        if !self.daemon_mode {
-            println!("[INFO] Listening on: {}", local_addr);
-        } else {
-            eprintln!("[INFO] Listening on: {}", local_addr);
+            println!("[INFO] Listening on: {}", self.socket.local_addr()?);
         }
         
         let mut packet_count = 0;
@@ -660,9 +670,18 @@ impl SipHoneypot {
                     });
                 }
                 Err(e) => {
+                    // En mode daemon, pas de console
                     if !self.daemon_mode {
                         eprintln!("[ERROR] Receive error: {}", e);
                     }
+                    
+                    // Logger l'erreur dans le fichier si disponible
+                    if let Some(writer) = &self.log_writer {
+                        let mut writer = writer.lock().await;
+                        let _ = writeln!(writer, 
+                            "[ERROR] Receive error: {}", e);
+                    }
+                    
                     tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
                 }
             }
@@ -672,134 +691,159 @@ impl SipHoneypot {
 
 // ==================== POINT D'ENTRÉE PRINCIPAL ====================
 
+#[cfg(unix)]
+fn redirect_stdout_stderr_to_dev_null() {
+    use std::os::unix::io::AsRawFd;
+    
+    // Ouvrir /dev/null
+    if let Ok(null) = std::fs::File::open("/dev/null") {
+        let null_fd = null.as_raw_fd();
+        
+        // Rediriger stdout et stderr vers /dev/null
+        unsafe {
+            libc::dup2(null_fd, libc::STDOUT_FILENO);
+            libc::dup2(null_fd, libc::STDERR_FILENO);
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let opt = Opt::from_args();
     
-    // Afficher le banner
-    println!("==========================================");
-    println!("SIP Honeypot v{}", env!("CARGO_PKG_VERSION"));
-    println!("==========================================");
+    // Vérification : en mode daemon, le fichier de log est OBLIGATOIRE
+    if opt.daemon && opt.log_file.is_none() {
+        eprintln!("[ERROR] Daemon mode requires a log file (-l/--log)");
+        std::process::exit(1);
+    }
+    
+    // Afficher le banner (uniquement en mode non-daemon)
+    if !opt.daemon {
+        println!("==========================================");
+        println!("SIP Honeypot v{}", env!("CARGO_PKG_VERSION"));
+        println!("==========================================");
+    }
     
     // Vérifier le port
-    if opt.port < 1024 && opt.daemon {
+    if opt.port < 1024 && !opt.daemon {
         eprintln!("[WARNING] Port {} is privileged. You might need root to bind.", opt.port);
     }
     
-    // Afficher les infos de l'utilisateur
-    eprintln!("[INFO] Starting as user: {}", 
-              std::env::var("USER").unwrap_or_else(|_| "unknown".to_string()));
-    eprintln!("[INFO] PID: {}", std::process::id());
-    eprintln!("[INFO] Working directory: {:?}", std::env::current_dir().unwrap());
+    // Afficher les infos utilisateur (uniquement en mode non-daemon)
+    if !opt.daemon {
+        eprintln!("[INFO] Starting as user: {}", 
+                  std::env::var("USER").unwrap_or_else(|_| "unknown".to_string()));
+        eprintln!("[INFO] PID: {}", std::process::id());
+        eprintln!("[INFO] Working directory: {:?}", std::env::current_dir().unwrap());
+    }
     
-    // Vérifier/Créer le répertoire pour le fichier de log AVANT daemonisation
+    // Vérifier/Créer le répertoire pour le fichier de log
     if let Some(log_path) = &opt.log_file {
         if let Some(parent) = log_path.parent() {
             if !parent.exists() {
                 std::fs::create_dir_all(parent)?;
-                eprintln!("[INFO] Created log directory: {:?}", parent);
+                if !opt.daemon {
+                    eprintln!("[INFO] Created log directory: {:?}", parent);
+                }
             }
         }
     }
     
-    // === DAEMONISATION DANS UN THREAD SÉPARÉ ===
+    // === MODE DAEMON : AUTO-RELANCE AVEC NOHUP ===
     if opt.daemon {
-        eprintln!("[INFO] Starting daemon mode...");
+        // Vérifier si on est déjà dans le processus fils (lancé par nohup)
+        let is_child = std::env::var("SIP_HONEYPOT_CHILD").unwrap_or_default() == "1";
         
-        use tokio::sync::oneshot;
-        let (tx, rx) = oneshot::channel();
-        
-        // Cloner opt pour le mouvement dans le thread
-        let opt_clone = opt.clone();
-        
-        std::thread::spawn(move || {
-            use daemonize::Daemonize;
-            use std::fs;
+        if !is_child {
+            // PREMIÈRE EXÉCUTION : on se relance avec nohup
+            let exe = std::env::current_exe()?;
+            let args: Vec<String> = std::env::args().collect();
             
-            // Daemonisation
-            let daemonize = Daemonize::new()
-                .pid_file(&opt_clone.pid_file)
-                .chown_pid_file(true)
-                .working_directory(".");  // Garde le répertoire courant
+            // Construire la commande nohup
+            let mut cmd = std::process::Command::new("nohup");
             
-            match daemonize.start() {
-                Ok(_) => {
-                    // Dans le processus enfant
-                    let pid = std::process::id();
-                    
-                    // Écrire un fichier de test
-                    let _ = fs::write("/tmp/sip-honeypot-daemon-test.txt", 
-                                      format!("Child process started at PID {}\n", pid));
-                    
-                    // Tester la création d'un socket UDP simple
-                    use std::net::UdpSocket;
-                    match UdpSocket::bind("0.0.0.0:0") {
-                        Ok(_) => {
-                            let _ = fs::write("/tmp/sip-honeypot-socket-test.txt", 
-                                             "Socket test successful\n");
-                        }
-                        Err(e) => {
-                            let _ = fs::write("/tmp/sip-honeypot-socket-test.txt", 
-                                             format!("Socket test failed: {}\n", e));
-                        }
+            // Rediriger stdout et stderr vers /dev/null pour éviter nohup.out
+            cmd.stdout(std::process::Stdio::null());
+            cmd.stderr(std::process::Stdio::null());
+            
+            cmd.arg(&exe);
+            
+            // Passer tous les arguments sauf -d/--daemon
+            let mut i = 1;
+            while i < args.len() {
+                match args[i].as_str() {
+                    "-d" | "--daemon" => {
+                        // Sauter l'option daemon
+                        i += 1;
                     }
-                    
-                    // Signaler au parent que la daemonisation a réussi
-                    let _ = tx.send(pid);
-                    
-                    // CRÉER UN NOUVEAU RUNTIME TOKIO DANS L'ENFANT
-                    let runtime = tokio::runtime::Runtime::new().unwrap();
-                    runtime.block_on(async {
-                        eprintln!("[INFO] Child process: creating SIP honeypot...");
-                        
-                        match SipHoneypot::new(&opt_clone, true).await {
-                            Ok(h) => {
-                                let honeypot = Arc::new(h);
-                                eprintln!("[INFO] Child process: honeypot created successfully");
-                                eprintln!("[INFO] Child process: starting main loop...");
-                                
-                                if let Err(e) = honeypot.run().await {
-                                    eprintln!("[ERROR] Child process: server error: {}", e);
-                                }
-                            }
-                            Err(e) => {
-                                eprintln!("[ERROR] Child process: failed to create honeypot: {}", e);
-                            }
+                    arg if arg.starts_with("-d") && arg.len() > 2 => {
+                        // Options combinées comme -dv
+                        let remaining = &arg[2..]; // Récupère "v" après "-d"
+                        if !remaining.is_empty() {
+                            // Ajouter un tiret pour l'option (ex: -v)
+                            cmd.arg(format!("-{}", remaining));
                         }
-                    });
+                        i += 1;
+                    }
+                    _ => {
+                        cmd.arg(&args[i]);
+                        i += 1;
+                    }
+                }
+            }
+            
+            // Ajouter une variable d'environnement pour identifier le processus fils
+            cmd.env("SIP_HONEYPOT_CHILD", "1");
+            
+            // Afficher les informations de démarrage (sur la console du parent)
+            println!("==========================================");
+            println!("SIP Honeypot v{}", env!("CARGO_PKG_VERSION"));
+            println!("==========================================");
+            println!("[INFO] Starting daemon mode...");
+            println!("[INFO] Log file: {:?}", opt.log_file);
+            println!("[INFO] nohup output redirected to /dev/null");
+            
+            // Lancer le processus
+            match cmd.spawn() {
+                Ok(child) => {
+                    // Écrire le PID dans le fichier
+                    std::fs::write(&opt.pid_file, child.id().to_string())?;
+                    
+                    println!("[INFO] Daemon started with PID: {}", child.id());
+                    println!("[INFO] Parent process exiting");
+                    
+                    // Le parent se termine immédiatement
+                    std::process::exit(0);
                 }
                 Err(e) => {
-                    eprintln!("[ERROR] Daemon startup failed: {}", e);
+                    eprintln!("[ERROR] Failed to start daemon: {}", e);
                     std::process::exit(1);
                 }
             }
-        });
-        
-        // Attendre que le processus enfant signale qu'il est prêt
-        match rx.await {
-            Ok(pid) => {
-                eprintln!("[INFO] Daemon child process running (PID: {})", pid);
-                eprintln!("[INFO] Parent process exiting");
-                std::process::exit(0);
-            }
-            Err(_) => {
-                eprintln!("[ERROR] Daemon child failed to start");
-                std::process::exit(1);
-            }
+        } else {
+            // PROCESSUS FILS (sous nohup)
+            // On est dans le processus nohup - rediriger stdout/stderr vers /dev/null
+            // pour être SÛR que rien n'aille dans nohup.out
+            redirect_stdout_stderr_to_dev_null();
         }
     }
     
-    // === MODE NORMAL (PAS DE DAEMON) ===
-    eprintln!("[INFO] Creating SIP honeypot instance...");
+    // === MODE NORMAL OU PROCESSUS FILS (DAEMON) ===
+    let is_daemon = opt.daemon; // true seulement dans le processus fils
     
-    let honeypot = Arc::new(SipHoneypot::new(&opt, false).await?);
+    // Créer l'instance du honeypot
+    let honeypot = Arc::new(SipHoneypot::new(&opt, is_daemon).await?);
     
-    println!("[INFO] SIP honeypot started in foreground");
-    println!("[INFO] PID: {}", std::process::id());
-    println!("[INFO] Address: {}:{}", opt.address, opt.port);
-    println!("[INFO] Waiting for UDP packets...");
-    println!("[INFO] Press Ctrl+C to stop");
+    // Message de démarrage (console en mode normal, fichier log en mode daemon)
+    if !is_daemon {
+        println!("[INFO] SIP honeypot started in foreground");
+        println!("[INFO] PID: {}", std::process::id());
+        println!("[INFO] Address: {}:{}", opt.address, opt.port);
+        println!("[INFO] Waiting for UDP packets...");
+        println!("[INFO] Press Ctrl+C to stop");
+    }
     
+    // Lancer la boucle principale
     honeypot.run().await?;
     
     Ok(())
